@@ -34,6 +34,8 @@ Entire flow orchestrated by AWS Step Functions, with SNS alerts on every failure
 
 **Step Function orchestration graph:**
 
+![Step Function Graph](assets/StepFunctionMapping.png)
+
 `IngestFromYouTubeAPI → WaitForS3Consistency → ProcessInParallel [TransformReferenceData || RunBronzeToSilverGlueJob] → RunDataQualityChecks → EvaluateDataQuality → RunSilverToGoldGlueJob → NotifySuccess`
 
 Every stage has a `Catch` block wired to its own SNS failure notification (`NotifyIngestionFailure`, `NotifyTransformFailure`, `NotifyDQFailure`, `NotifyGoldFailure`).
@@ -212,4 +214,4 @@ ORDER BY region_count DESC;
 
 ## License
 
-MIT — do whatever you want with it, no warranty.  
+MIT — do whatever you want with it, no warranty.
