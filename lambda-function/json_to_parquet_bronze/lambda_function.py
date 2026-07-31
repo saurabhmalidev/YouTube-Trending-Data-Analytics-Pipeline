@@ -89,6 +89,8 @@ def send_alert(subject: str, message: str):
 def lambda_handler(event, context):
     """Process S3 event for new JSON reference files."""
 
+    logger.info(f"RAW EVENT: {json.dumps(event)}")
+
     # Handle both direct S3 events and EventBridge-wrapped events
     records = event.get("Records", [])
     if not records:
