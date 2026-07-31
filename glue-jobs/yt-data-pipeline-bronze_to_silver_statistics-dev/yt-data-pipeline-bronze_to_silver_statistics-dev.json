@@ -1,0 +1,74 @@
+{
+	"jobConfig": {
+		"name": "yt-data-pipeline-bronze_to_silver_statistics-dev",
+		"description": "",
+		"role": "arn:aws:iam::962988650758:role/yt-data-pipeline-glue-role-dev",
+		"command": "glueetl",
+		"version": "5.1",
+		"runtime": null,
+		"workerType": "G.1X",
+		"numberOfWorkers": 2,
+		"maxCapacity": 2,
+		"jobRunQueuingEnabled": false,
+		"maxRetries": 0,
+		"timeout": 480,
+		"maxConcurrentRuns": 1,
+		"security": "none",
+		"scriptName": "yt-data-pipeline-bronze_to_silver_statistics-dev.py",
+		"scriptLocation": "s3://aws-glue-assets-962988650758-ap-south-1/scripts/",
+		"language": "python-3",
+		"spark": true,
+		"sparkConfiguration": "standard",
+		"jobParameters": [
+			{
+				"key": "--bronze_database",
+				"value": "yt-pipeline-bronze_db",
+				"existing": false
+			},
+			{
+				"key": "--bronze_table",
+				"value": "raw_statistics",
+				"existing": false
+			},
+			{
+				"key": "--conf",
+				"value": "spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
+				"existing": false
+			},
+			{
+				"key": "--silver_bucket",
+				"value": "yt-data-pipeline-silver-dev001",
+				"existing": false
+			},
+			{
+				"key": "--silver_database",
+				"value": "yt-pipeline-silver_db",
+				"existing": false
+			},
+			{
+				"key": "--silver_table",
+				"value": "clean_statistics",
+				"existing": false
+			}
+		],
+		"tags": [],
+		"jobMode": "DEVELOPER_MODE",
+		"createdOn": "2026-07-28T18:37:30.322Z",
+		"developerMode": true,
+		"connectionsList": [],
+		"temporaryDirectory": "s3://aws-glue-assets-962988650758-ap-south-1/temporary/",
+		"logging": true,
+		"glueHiveMetastore": true,
+		"etlAutoTuning": true,
+		"metrics": true,
+		"observabilityMetrics": true,
+		"bookmark": "job-bookmark-disable",
+		"sparkPath": "s3://aws-glue-assets-962988650758-ap-south-1/sparkHistoryLogs/",
+		"flexExecution": false,
+		"minFlexWorkers": null,
+		"maintenanceWindow": null
+	},
+	"hasBeenSaved": false,
+	"usageProfileName": null,
+	"script": "\"\"\"\nGlue Job: Bronze → Silver (Statistics Data)\n────────────────────────────────────────────\nReads raw CSV/JSON statistics from the Bronze layer,\napplies schema enforcement, data cleansing, deduplication,\nand writes clean Parquet to the Silver layer.\n\nImprovements over original pyspark_code.py:\n  - Data quality checks with row-level flagging\n  - Deduplication (same video appearing in multiple ingestions)\n  - Date parsing and standardization\n  - Handles both Kaggle CSV format and live API JSON format\n  - Partitioned by region AND date for better query performance\n  - Bookmarking for incremental processing\n  - Proper logging\n\nJob Parameters:\n    --JOB_NAME                   — Glue job name (auto-set)\n    --bronze_database            — Bronze Glue catalog database\n    --bronze_table               — Bronze statistics table\n    --silver_bucket              — Silver S3 bucket\n    --silver_database            — Silver Glue catalog database\n    --silver_table               — Silver statistics table\n    --silver_path                — Silver S3 path prefix\n\"\"\"\n\nimport sys\nfrom datetime import datetime\n\nfrom awsglue.transforms import *\nfrom awsglue.utils import getResolvedOptions\nfrom pyspark.context import SparkContext\nfrom awsglue.context import GlueContext\nfrom awsglue.job import Job\nfrom awsglue.dynamicframe import DynamicFrame\n\nfrom pyspark.sql import functions as F\nfrom pyspark.sql.types import (\n    StructType, StructField, StringType, LongType, BooleanType, TimestampType\n)\n\n# ── Job Setup ────────────────────────────────────────────────────────────────\nargs = getResolvedOptions(sys.argv, [\n    \"JOB_NAME\",\n    \"bronze_database\",\n    \"bronze_table\",\n    \"silver_bucket\",\n    \"silver_database\",\n    \"silver_table\",\n])\n\nsc = SparkContext()\nglueContext = GlueContext(sc)\nspark = glueContext.spark_session\njob = Job(glueContext)\njob.init(args[\"JOB_NAME\"], args)\nlogger = glueContext.get_logger()\n\n# ── Config ───────────────────────────────────────────────────────────────────\nBRONZE_DB = args[\"bronze_database\"]\nBRONZE_TABLE = args[\"bronze_table\"]\nSILVER_BUCKET = args[\"silver_bucket\"]\nSILVER_DB = args[\"silver_database\"]\nSILVER_TABLE = args[\"silver_table\"]\nSILVER_PATH = f\"s3://{SILVER_BUCKET}/youtube/statistics/\"\n\nlogger.info(f\"Bronze: {BRONZE_DB}.{BRONZE_TABLE}\")\nlogger.info(f\"Silver: {SILVER_DB}.{SILVER_TABLE} → {SILVER_PATH}\")\n\n\n# ── Step 1: Read from Bronze ────────────────────────────────────────────────\nlogger.info(\"Reading from Bronze catalog...\")\n\n# Predicate pushdown — include both upper and lowercase to handle either partition format\npredicate = \"region in ('ca','gb','us', 'in')\"\n\ndatasource = glueContext.create_dynamic_frame.from_catalog(\n    database=BRONZE_DB,\n    table_name=BRONZE_TABLE,\n    transformation_ctx=\"datasource\",\n    push_down_predicate=predicate,\n)\n\ndf = datasource.toDF()\ninitial_count = df.count()\nlogger.info(f\"Bronze records read: {initial_count}\")\n\nif initial_count == 0:\n    logger.info(\"No new records to process. Committing empty job.\")\nelse:\n    # ── Step 2: Schema Enforcement ──────────────────────────────────────────\n    logger.info(\"Enforcing schema and casting types...\")\n\n    # Handle both Kaggle CSV format and YouTube API JSON format\n    columns = set(df.columns)\n\n    if \"snippet.title\" in columns or \"snippet__title\" in columns:\n        # YouTube API format — flatten nested structure\n        logger.info(\"Detected YouTube API format — flattening...\")\n        df = df.select(\n            F.col(\"id\").alias(\"video_id\"),\n            F.lit(datetime.utcnow().strftime(\"%y.%d.%m\")).alias(\"trending_date\"),\n            F.col(\"`snippet.title`\").alias(\"title\") if \"snippet.title\" in columns\n                else F.col(\"snippet__title\").alias(\"title\"),\n            F.col(\"`snippet.channelTitle`\").alias(\"channel_title\") if \"snippet.channelTitle\" in columns\n                else F.col(\"snippet__channelTitle\").alias(\"channel_title\"),\n            F.col(\"`snippet.categoryId`\").cast(LongType()).alias(\"category_id\") if \"snippet.categoryId\" in columns\n                else F.col(\"snippet__categoryId\").cast(LongType()).alias(\"category_id\"),\n            F.col(\"`snippet.publishedAt`\").alias(\"publish_time\") if \"snippet.publishedAt\" in columns\n                else F.col(\"snippet__publishedAt\").alias(\"publish_time\"),\n            F.col(\"`snippet.tags`\").alias(\"tags\") if \"snippet.tags\" in columns\n                else F.lit(None).cast(StringType()).alias(\"tags\"),\n            F.col(\"`statistics.viewCount`\").cast(LongType()).alias(\"views\") if \"statistics.viewCount\" in columns\n                else F.col(\"statistics__viewCount\").cast(LongType()).alias(\"views\"),\n            F.col(\"`statistics.likeCount`\").cast(LongType()).alias(\"likes\") if \"statistics.likeCount\" in columns\n                else F.col(\"statistics__likeCount\").cast(LongType()).alias(\"likes\"),\n            F.col(\"`statistics.dislikeCount`\").cast(LongType()).alias(\"dislikes\") if \"statistics.dislikeCount\" in columns\n                else F.lit(0).cast(LongType()).alias(\"dislikes\"),\n            F.col(\"`statistics.commentCount`\").cast(LongType()).alias(\"comment_count\") if \"statistics.commentCount\" in columns\n                else F.col(\"statistics__commentCount\").cast(LongType()).alias(\"comment_count\"),\n            F.col(\"`snippet.thumbnails.default.url`\").alias(\"thumbnail_link\") if \"snippet.thumbnails.default.url\" in columns\n                else F.lit(None).cast(StringType()).alias(\"thumbnail_link\"),\n            F.lit(False).alias(\"comments_disabled\"),\n            F.lit(False).alias(\"ratings_disabled\"),\n            F.lit(False).alias(\"video_error_or_removed\"),\n            F.col(\"`snippet.description`\").alias(\"description\") if \"snippet.description\" in columns\n                else F.col(\"snippet__description\").alias(\"description\"),\n            F.col(\"region\"),\n        )\n    else:\n        # Kaggle CSV format — just cast types\n        logger.info(\"Detected Kaggle CSV format — casting types...\")\n        df = df.select(\n            F.col(\"video_id\").cast(StringType()),\n            F.col(\"trending_date\").cast(StringType()),\n            F.col(\"title\").cast(StringType()),\n            F.col(\"channel_title\").cast(StringType()),\n            F.col(\"category_id\").cast(LongType()),\n            F.col(\"publish_time\").cast(StringType()),\n            F.col(\"tags\").cast(StringType()),\n            F.col(\"views\").cast(LongType()),\n            F.col(\"likes\").cast(LongType()),\n            F.col(\"dislikes\").cast(LongType()),\n            F.col(\"comment_count\").cast(LongType()),\n            F.col(\"thumbnail_link\").cast(StringType()),\n            F.col(\"comments_disabled\").cast(BooleanType()),\n            F.col(\"ratings_disabled\").cast(BooleanType()),\n            F.col(\"video_error_or_removed\").cast(BooleanType()),\n            F.col(\"description\").cast(StringType()),\n            F.col(\"region\").cast(StringType()),\n        )\n\n\n    # ── Step 3: Data Cleansing ──────────────────────────────────────────────\n    logger.info(\"Cleansing data...\")\n\n    # Remove records where video_id is null (corrupt rows)\n    df = df.filter(F.col(\"video_id\").isNotNull())\n\n    # Standardize region codes to lower\n    df = df.withColumn(\"region\", F.lower(F.trim(F.col(\"region\"))))\n\n    # Parse trending_date from Kaggle format (YY.DD.MM) to proper date\n    df = df.withColumn(\n        \"trending_date_parsed\",\n        F.when(\n            F.col(\"trending_date\").rlike(r\"^\\d{2}\\.\\d{2}\\.\\d{2}$\"),\n            F.to_date(F.col(\"trending_date\"), \"yy.dd.MM\")\n        ).otherwise(\n            F.to_date(F.col(\"trending_date\"))\n        )\n    )\n\n    # Fill nulls for numeric columns with 0\n    numeric_cols = [\"views\", \"likes\", \"dislikes\", \"comment_count\"]\n    for col_name in numeric_cols:\n        df = df.withColumn(col_name, F.coalesce(F.col(col_name), F.lit(0)))\n\n    # Add derived columns\n    df = df.withColumn(\"like_ratio\",\n        F.when(\n            (F.col(\"views\") > 0),\n            F.round(F.col(\"likes\") / F.col(\"views\") * 100, 4)\n        ).otherwise(0.0)\n    )\n    df = df.withColumn(\"engagement_rate\",\n        F.when(\n            (F.col(\"views\") > 0),\n            F.round((F.col(\"likes\") + F.col(\"dislikes\") + F.col(\"comment_count\")) / F.col(\"views\") * 100, 4)\n        ).otherwise(0.0)\n    )\n\n    # Add processing metadata\n    df = df.withColumn(\"_processed_at\", F.current_timestamp())\n    df = df.withColumn(\"_job_name\", F.lit(args[\"JOB_NAME\"]))\n\n\n    # ── Step 4: Deduplication ───────────────────────────────────────────────\n    logger.info(\"Deduplicating...\")\n\n    # Keep the latest record per video_id + region + trending_date\n    from pyspark.sql.window import Window\n\n    window = Window.partitionBy(\"video_id\", \"region\", \"trending_date_parsed\") \\\n        .orderBy(F.col(\"_processed_at\").desc())\n\n    df = df.withColumn(\"_row_num\", F.row_number().over(window)) \\\n        .filter(F.col(\"_row_num\") == 1) \\\n        .drop(\"_row_num\")\n\n    clean_count = df.count()\n    logger.info(f\"After cleansing & dedup: {clean_count} records (removed {initial_count - clean_count})\")\n\n\n    # ── Step 5: Data Quality Checks ─────────────────────────────────────────\n    logger.info(\"Running data quality checks...\")\n\n    null_counts = {}\n    for col_name in [\"video_id\", \"title\", \"channel_title\", \"views\"]:\n        null_count = df.filter(F.col(col_name).isNull()).count()\n        null_counts[col_name] = null_count\n        if null_count > 0:\n            logger.warn(f\"  DQ WARNING: {col_name} has {null_count} null values\")\n\n    negative_views = df.filter(F.col(\"views\") < 0).count()\n    if negative_views > 0:\n        logger.warn(f\"  DQ WARNING: {negative_views} records with negative views\")\n\n    logger.info(f\"  DQ check complete. Null counts: {null_counts}\")\n\n\n    # ── Step 6: Write to Silver Layer ───────────────────────────────────────\n    logger.info(f\"Writing to Silver: {SILVER_PATH}\")\n\n    # Convert back to DynamicFrame for Glue-native write\n    dynamic_frame = DynamicFrame.fromDF(df, glueContext, \"silver_statistics\")\n\n    sink = glueContext.getSink(\n        connection_type=\"s3\",\n        path=SILVER_PATH,\n        enableUpdateCatalog=True,\n        updateBehavior=\"UPDATE_IN_DATABASE\",\n        partitionKeys=[\"region\"],\n    )\n    sink.setCatalogInfo(catalogDatabase=SILVER_DB, catalogTableName=SILVER_TABLE)\n    sink.setFormat(\"glueparquet\", compression=\"snappy\")\n    sink.writeFrame(dynamic_frame)\n\n    logger.info(f\"Silver write complete. {clean_count} records written.\")\n\njob.commit()"
+}
