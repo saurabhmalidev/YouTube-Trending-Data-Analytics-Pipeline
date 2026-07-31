@@ -85,7 +85,7 @@ Hypothetical client scenario: a company planning a YouTube ad campaign needs to 
 | `yt-data-pipeline-silver-dev001` | Cleaned Parquet — `youtube/statistics/`, `youtube/reference_data/` |
 | `yt-data-pipeline-gold-dev001` | Aggregated analytics tables |
 | `yt-data-pipeline-scripts-dev001` | Glue script storage |
-| Athena results bucket | Query output for Athena + the DQ Lambda |
+| `yt-data-pipeline-glue-athena-result-bucket` | Query output for Athena + the DQ Lambda |
 
 | Glue Database | Tables |
 |---|---|
