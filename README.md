@@ -20,7 +20,7 @@ An end-to-end, serverless data engineering pipeline on AWS that ingests YouTube 
 
 ## Architecture
 
-![Architecture](assets/StepFunctionMapping.png)
+
 
 ```
 YouTube Data API ─┐
@@ -61,9 +61,9 @@ Entire flow orchestrated by AWS Step Functions. SNS alert on every failure branc
 
 ---
 
-## Step Function Orchestration
+## Step Function visual workflow
 
-![Step Function Graph](assets/step-function-graph.png)
+![Step Function Graph](assets/StepFunctionMapping.png)
 
 `IngestFromYouTubeAPI → WaitForS3Consistency → ProcessInParallel [TransformReferenceData ‖ RunBronzeToSilverGlueJob] → RunDataQualityChecks → EvaluateDataQuality → RunSilverToGoldGlueJob → NotifySuccess`
 
