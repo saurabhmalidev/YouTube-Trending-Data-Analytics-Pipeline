@@ -1,103 +1,93 @@
 # YouTube Trending Data Pipeline — AWS (S3 · Glue · Lambda · Athena · Step Functions)
 
-An end-to-end, serverless data pipeline on AWS that ingests YouTube trending video data (live via the YouTube Data API v3, plus a static Kaggle dataset), processes it through a **medallion architecture (Bronze → Silver → Gold)**, runs automated data quality checks, and produces analytics-ready tables queryable via Amazon Athena — fully orchestrated with AWS Step Functions.
+An end-to-end, serverless data engineering pipeline on AWS that ingests YouTube trending video data — live via the **YouTube Data API v3**, plus a static Kaggle dataset — processes it through a medallion architecture (Bronze → Silver → Gold), runs automated data quality gating, and produces analytics-ready tables queryable via Amazon Athena. Fully orchestrated with AWS Step Functions, with SNS alerting on every failure branch.
+
+---
+
+## Tech Stack
+
+![AWS](https://img.shields.io/badge/AWS-232F3E?style=flat&logo=amazon-aws&logoColor=white)
+![S3](https://img.shields.io/badge/Amazon%20S3-569A31?style=flat&logo=amazons3&logoColor=white)
+![AWS Glue](https://img.shields.io/badge/AWS%20Glue-8C4FFF?style=flat)
+![AWS Lambda](https://img.shields.io/badge/AWS%20Lambda-FF9900?style=flat&logo=awslambda&logoColor=white)
+![Athena](https://img.shields.io/badge/Amazon%20Athena-232F3E?style=flat)
+![Step Functions](https://img.shields.io/badge/Step%20Functions-CD2264?style=flat)
+![SNS](https://img.shields.io/badge/Amazon%20SNS-DD344C?style=flat)
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
+![PySpark](https://img.shields.io/badge/PySpark-E25A1C?style=flat&logo=apachespark&logoColor=white)
 
 ---
 
 ## Architecture
 
+![Architecture](assets/StepFunctionMapping.png)
+
 ```
 YouTube Data API ─┐
-                   ├─► S3 Bronze (raw JSON/CSV, partitioned by region/date)
+                   ├─► S3 Bronze (raw JSON/CSV, partitioned by region/date/hour)
 Kaggle static data ┘
         │
         ▼
-  Lambda (JSON → Parquet)  +  Glue (PySpark ETL, CSV/JSON → Parquet)
+  Lambda (JSON → Parquet)   +   Glue PySpark ETL (CSV/JSON → Parquet)
         │
         ▼
   S3 Silver (cleaned, deduplicated, schema-enforced Parquet)
         │
         ▼
-  Lambda Data Quality Gate (row count, null %, schema, value range, freshness — via Athena)
+  Lambda Data Quality Gate — row count, null %, schema, value range, freshness (via Athena)
         │
-        ▼ (pass only)
-  Glue (Silver → Gold aggregations)
+        ▼  (pass only)
+  Glue PySpark ETL (Silver → Gold aggregations)
         │
         ▼
-  S3 Gold (trending_analytics, channel_analytics, category_analytics)
+  S3 Gold — trending_analytics · channel_analytics · category_analytics
         │
         ▼
   Amazon Athena (SQL) / QuickSight (BI)
 
-Entire flow orchestrated by AWS Step Functions, with SNS alerts on every failure branch.
+Entire flow orchestrated by AWS Step Functions. SNS alert on every failure branch.
 ```
 
-**Step Function orchestration graph:**
-
-![Step Function Graph](assets/StepFunctionMapping.png)
-
-`IngestFromYouTubeAPI → WaitForS3Consistency → ProcessInParallel [TransformReferenceData || RunBronzeToSilverGlueJob] → RunDataQualityChecks → EvaluateDataQuality → RunSilverToGoldGlueJob → NotifySuccess`
-
-Every stage has a `Catch` block wired to its own SNS failure notification (`NotifyIngestionFailure`, `NotifyTransformFailure`, `NotifyDQFailure`, `NotifyGoldFailure`).
-
----
-
-## Why this exists
-
-Client scenario (hypothetical): a company wants to run a YouTube ad campaign and needs to understand what makes videos trend — by category, region, and channel — before spending marketing budget. Goals: automated ingestion, a proper data lake (medallion architecture), cloud-native ETL, and analytics that scale.
+| Layer | Tool | What happens |
+|---|---|---|
+| Source | YouTube Data API v3 + Kaggle CSV/JSON | Live trending videos + category metadata, per region |
+| Ingestion | Lambda (`yt-lambda-ingestion`) | Pulls trending + category data, writes raw JSON to Bronze, Hive-partitioned |
+| Bronze | S3 | Raw data as-is, lifecycle rule archives to Glacier after 90 days |
+| Silver | Lambda + Glue (PySpark) | Schema enforcement, dedup, date parsing, derived metrics (`like_ratio`, `engagement_rate`) |
+| Quality Gate | Lambda + Athena | 5 automated checks block Gold if data fails |
+| Gold | Glue (PySpark) | 3 pre-aggregated Parquet tables optimized for BI |
+| Query | Amazon Athena | Serverless SQL directly on S3, backed by Glue Data Catalog |
+| Orchestration | AWS Step Functions | Full pipeline, parallel branches, retries, SNS on every failure path |
 
 ---
 
-## Repo Structure
+## Step Function Orchestration
 
-```
-.
-├── data/                  # Kaggle static dataset (CSV + JSON per region)
-├── lambda-function/       # Lambda source code
-│   ├── yt-lambda-ingestion/        # Pulls trending videos + categories from YouTube API → Bronze
-│   ├── yt-lambda-json-to-parquet/  # Converts raw JSON reference data → Silver Parquet
-│   └── data-quality/               # Runs DQ checks against Silver tables via Athena
-├── glue-jobs/             # PySpark Glue ETL scripts
-│   ├── bronze_to_silver_statistics.py
-│   └── silver_to_gold_analytics.py
-├── step-function/         # State machine definition (ASL JSON)
-├── scripts/               # AWS CLI / bash upload scripts
-└── README.md
-```
+![Step Function Graph](assets/step-function-graph.png)
+
+`IngestFromYouTubeAPI → WaitForS3Consistency → ProcessInParallel [TransformReferenceData ‖ RunBronzeToSilverGlueJob] → RunDataQualityChecks → EvaluateDataQuality → RunSilverToGoldGlueJob → NotifySuccess`
+
+Every branch has its own `Catch` wired to a dedicated SNS alert: `NotifyIngestionFailure`, `NotifyTransformFailure`, `NotifyDQFailure`, `NotifyGoldFailure`.
 
 ---
 
-## AWS Services Used
+## Why This Exists
 
-| Service | Purpose |
-|---|---|
-| **S3** | Bronze/Silver/Gold storage + scripts + Athena query results. Lifecycle rule archives raw data to Glacier Flexible Retrieval after 90 days. |
-| **Lambda** | YouTube API ingestion, JSON→Parquet transform, data quality checks |
-| **Glue (Spark, v5.1)** | Bronze→Silver and Silver→Gold ETL jobs, Data Catalog, Crawlers |
-| **Athena** | Ad-hoc SQL + the query engine behind the Lambda data quality checks |
-| **Step Functions** | Orchestrates the full pipeline end-to-end |
-| **SNS** | Email alerts on success/failure for every stage |
-| **IAM** | Least-privilege roles per service (see below) |
+Hypothetical client scenario: a company planning a YouTube ad campaign needs to understand what makes videos trend — by category, region, and channel — before spending marketing budget. Goals: automated ingestion, a real data lake (medallion architecture), cloud-native ETL, and analytics that scale beyond a one-off spreadsheet pull.
 
 ---
 
-## S3 Layout
+## Storage Layout
 
 | Bucket | Purpose |
 |---|---|
-| `yt-data-pipeline-bronze-dev001` | Raw ingested data (`youtube/raw_statistics/`, `youtube/raw_statistics_reference_data/`) |
-| `yt-data-pipeline-silver-dev001` | Cleaned Parquet (`youtube/statistics/`, `youtube/reference_data/`) |
+| `yt-data-pipeline-bronze-dev001` | Raw ingested data — `youtube/raw_statistics/`, `youtube/raw_statistics_reference_data/` |
+| `yt-data-pipeline-silver-dev001` | Cleaned Parquet — `youtube/statistics/`, `youtube/reference_data/` |
 | `yt-data-pipeline-gold-dev001` | Aggregated analytics tables |
 | `yt-data-pipeline-scripts-dev001` | Glue script storage |
-| Athena results bucket | Query output location for Athena / DQ Lambda |
+| Athena results bucket | Query output for Athena + the DQ Lambda |
 
-Bronze data under `/youtube/` transitions to **Glacier Flexible Retrieval after 90 days** via an S3 lifecycle rule.
-
----
-
-## Glue Data Catalog
-
-| Database | Tables |
+| Glue Database | Tables |
 |---|---|
 | `yt-pipeline-bronze_db` | `raw_statistics`, `raw_statistics_reference_data` |
 | `yt-pipeline-silver_db` | `clean_statistics`, `clean_reference_data` |
@@ -105,60 +95,46 @@ Bronze data under `/youtube/` transitions to **Glacier Flexible Retrieval after 
 
 ---
 
-## IAM Roles (least privilege, not admin)
+## Pipeline Walkthrough
 
-- **`yt-data-pipeline-lambda-role-dev`** — `AWSLambdaBasicExecutionRole` + inline policy scoped to `s3:GetObject/PutObject/ListBucket` on Bronze/Silver/Gold/scripts buckets only, plus Glue (get/create table, partitions), Athena (query execution), SNS publish.
-- **`yt-data-pipeline-glue-role-dev`** — `AWSGlueServiceRole` + `AmazonS3FullAccess` + inline policy for S3/Glue/Athena/SNS.
-- **`yt-data-pipeline-stepFunction-role-dev`** — `lambda:InvokeFunction`, `glue:StartJobRun/GetJobRun/GetJobRuns/BatchStopJobRun`, `sns:Publish` scoped to the project's SNS topic.
+#### 1. Ingestion — Lambda
 
-> Lesson learned the hard way: giving a role access to S3 buckets isn't enough — the Step Function role, the Lambda role, *and* whatever queries Athena all separately need read/write access to the **Athena query-results bucket**, not just the data buckets. Half the debugging time in this build went into `AccessDenied` errors from that being missed.
+- `yt-data-pipeline-yt-lambda-ingestion-dev` calls the YouTube Data API v3 (`videos?chart=mostPopular` + `videoCategories`) per region: **US, GB, CA, IN**.
+- Writes raw JSON to Bronze, Hive-style partitioned: `region=us/date=2026-08-01/hour=14/`.
+- Failures per-region are caught and reported individually — one bad region doesn't kill the whole run.
 
----
+#### 2. Bronze → Silver — Lambda + Glue
 
-## Lambda Functions
+- Reference/category data: Lambda converts nested JSON → Parquet using `pandas.json_normalize`, deduplicates on category `id`, writes via `awswrangler` with `overwrite_partitions` (idempotent per region).
+- Statistics data: Glue PySpark job auto-detects Kaggle CSV vs. live API JSON schema, enforces types, parses `trending_date` into a real date, fills numeric nulls, computes `like_ratio` and `engagement_rate`, and deduplicates on `video_id + region + trending_date` using a window function.
 
-| Function | Trigger | Role |
-|---|---|---|
-| `yt-data-pipeline-yt-lambda-ingestion-dev` | Scheduled / Step Functions | Pulls trending videos + category mappings from YouTube Data API v3 per region, writes raw JSON to Bronze, Hive-partitioned by `region/date/hour` |
-| `yt-data-pipeline-yt-lambda-json-to-parquet-dev` | S3 event on Bronze reference-data prefix | Validates + deduplicates category JSON, writes Parquet to Silver, updates Glue Catalog |
-| `yt-data-pipeline-data-quality-dev` | Step Functions | Runs 5 checks (row count, null %, schema, value range, freshness) against Silver tables via Athena; publishes SNS alert on failure |
+#### 3. Data Quality Gate — Lambda + Athena
 
-**Common config:** Python 3.12, 512 MB memory, 1024 MB ephemeral storage, 5 min 3 sec timeout, `AWSSDKPandas-Python312` layer.
+Runs against Silver before Gold is allowed to build:
 
-**Regions covered:** US, GB, CA, IN (configurable via `YOUTUBE_REGIONS` env var).
+| Check | What it catches |
+|---|---|
+| Row count | Empty or truncated loads |
+| Null percentage | Missing critical fields (`video_id`, `title`, `views`, `region`) |
+| Schema validation | Missing expected columns |
+| Value range | Negative or absurd (>50B) view counts |
+| Freshness | Data older than 48 hours (skipped gracefully for backfills with no timestamp) |
 
----
+Any failed check blocks `RunSilverToGoldGlueJob` and fires `NotifyDQFailure` with full failure detail attached.
 
-## Glue Jobs
+#### 4. Silver → Gold — Glue
 
-### `yt-data-pipeline-bronze_to_silver_statistics-dev`
-Reads raw CSV (Kaggle format) or JSON (live API format) from Bronze, auto-detects format, enforces schema, parses/standardizes `trending_date`, fills numeric nulls, computes `like_ratio` and `engagement_rate`, deduplicates on `video_id + region + trending_date` via window function, writes partitioned Parquet to Silver + updates Data Catalog.
+Joins clean statistics with category reference data (falls back to `"Unknown"` if the join or reference data is missing), builds:
 
-### `yt-data-pipeline-silver_to_gold-analytics-dev`
-Joins clean statistics with category reference data (with a fallback to `"Unknown"` if the join fails or reference data is missing), produces three Gold tables:
-- **trending_analytics** — daily region-level summaries
-- **channel_analytics** — per-channel performance, ranked by views within region
-- **category_analytics** — category trends over time with view-share %
+| Table | Aggregation |
+|---|---|
+| `trending_analytics` | Daily region-level summaries: total views, avg engagement, unique channels |
+| `channel_analytics` | Per-channel performance, ranked by views within region |
+| `category_analytics` | Category trends over time with view-share % per region/day |
 
-**Common config:** Glue 5.1 (Spark 3.5), `G.1X` workers × 2, job bookmarking disabled.
+#### 5. Query — Athena
 
----
-
-## Data Quality Checks
-
-Run against Silver layer before Gold aggregation is allowed to proceed:
-
-1. **Row count** — minimum threshold
-2. **Null percentage** — per critical column (`video_id`, `title`, `channel_title`, `views`, `region`)
-3. **Schema validation** — required columns present
-4. **Value range** — no negative or absurd (>50B) view counts
-5. **Freshness** — data no older than 48 hours (skipped gracefully if no timestamp column, e.g. backfills)
-
-Failure on any check blocks the Gold job and fires an SNS alert with the full failure detail.
-
----
-
-## Sample Athena Queries
+Serverless SQL directly against Gold, no data movement, backed by the Glue Data Catalog.
 
 ```sql
 -- Top trending days by views, US
@@ -168,12 +144,6 @@ FROM trending_analytics
 WHERE region = 'us'
 ORDER BY total_views DESC
 LIMIT 10;
-
--- Cross-region engagement comparison
-SELECT region, AVG(avg_engagement_rate) AS avg_engagement,
-       SUM(total_views) AS cumulative_views
-FROM trending_analytics
-GROUP BY region;
 
 -- Viral channels trending in 3+ regions
 SELECT channel_title, COUNT(DISTINCT region) AS region_count
@@ -185,33 +155,111 @@ ORDER BY region_count DESC;
 
 ---
 
-## Setup
+## IAM — Least Privilege, Not Admin
 
-1. Create an AWS account and configure the AWS CLI (`aws configure`) with an IAM user/keys scoped for this project (not root).
-2. Get a **YouTube Data API v3** key from the Google Cloud Console.
-3. Create the S3 buckets (Bronze/Silver/Gold/Scripts/Athena-results) and set the Bronze lifecycle rule.
-4. Create the IAM roles above and attach the inline policies.
-5. Create the SNS topic and subscribe your email.
-6. Deploy the three Lambda functions with their env vars (see each function's docstring for the required variable names).
-7. Create the two Glue jobs, pointing `--*` job parameters at your actual bucket/database names.
-8. Run Glue Crawlers once to bootstrap the Bronze catalog (afterward, `enableUpdateCatalog` on the Glue sinks keeps Silver/Gold catalogs in sync automatically).
-9. Deploy the Step Function state machine (`step-function/`) using the `yt-data-pipeline-stepFunction-role-dev` role.
-10. Start an execution and watch it in the Step Functions Graph view.
+| Role | Scope |
+|---|---|
+| `yt-data-pipeline-lambda-role-dev` | `AWSLambdaBasicExecutionRole` + inline policy: S3 get/put/list scoped to the 4 project buckets only, Glue table/partition ops, Athena query execution, SNS publish |
+| `yt-data-pipeline-glue-role-dev` | `AWSGlueServiceRole` + inline policy for S3/Glue/Athena/SNS |
+| `yt-data-pipeline-stepFunction-role-dev` | `lambda:InvokeFunction`, `glue:StartJobRun/GetJobRun*/BatchStopJobRun`, `sns:Publish` scoped to the project SNS topic |
 
-**Never commit real API keys, account IDs, or ARNs to this repo.** Use environment variables / AWS Secrets Manager, and scrub any setup notes before pushing.
+---
+
+## Key Engineering Decisions
+
+**Lambda for JSON, Glue for CSV+JSON at scale.** Category reference data is small and simple enough for Lambda + pandas. The statistics data needs schema reconciliation across two very different source formats (Kaggle CSV vs. live API JSON) at higher volume — that's a Spark job, not a Lambda function.
+
+**Data quality as a hard gate, not a dashboard.** The Gold job physically cannot run unless the DQ Lambda returns `quality_passed: true`. Bad data doesn't get a chance to reach analytics tables silently.
+
+**`overwrite_partitions` over append for reference data.** Category mappings are re-ingested every run; appending would just accumulate duplicate rows per region. Overwriting the partition keeps it idempotent.
+
+**Every failure path gets its own SNS message, not one generic alert.** Ingestion failure, transform failure, DQ failure, and Gold failure all page differently — knowing *which* stage broke without opening the console saves real debugging time.
+
+**Least-privilege IAM per service, not shared admin roles.** More setup work up front; the trade-off is deliberate given this touches a live external API key and multiple S3 buckets.
+
+**Athena as the query layer for both BI and the DQ checks.** No separate warehouse — the DQ Lambda queries the same Glue Catalog tables a human would query in Athena, so "what the checks see" and "what you can query" never drift apart.
+
+---
+
+## Repo Structure
+
+![Repo Structure](assets/repo-structure.png)
+
+```
+youtube-data-pipeline-aws-s3-glue-lambda-athena-stepfunction/
+│
+├── data/                     # Kaggle static dataset (CSV + JSON per region)
+│
+├── lambda-function/
+│   ├── yt-lambda-ingestion/            # YouTube API → Bronze
+│   ├── yt-lambda-json-to-parquet/      # Bronze reference JSON → Silver Parquet
+│   └── data-quality/                   # Athena-backed DQ checks
+│
+├── glue-jobs/
+│   ├── bronze_to_silver_statistics.py
+│   └── silver_to_gold_analytics.py
+│
+├── step-function/
+│   └── orchestration.asl.json
+│
+├── scripts/                  # AWS CLI / bash upload scripts
+│
+├── assets/                   # Architecture diagram, screenshots
+│
+└── README.md
+```
+
+---
+
+## How to Run
+
+### Prerequisites
+
+- AWS account + AWS CLI configured (`aws configure`) with a scoped IAM user — not root
+- YouTube Data API v3 key (Google Cloud Console)
+- Python 3.12
+
+### Steps
+
+1. **Create buckets** — Bronze, Silver, Gold, Scripts, Athena-results. Set the Bronze lifecycle rule to transition `/youtube/*` to Glacier Flexible Retrieval after 90 days.
+
+2. **Create IAM roles** — `yt-data-pipeline-lambda-role-dev`, `yt-data-pipeline-glue-role-dev`, `yt-data-pipeline-stepFunction-role-dev` — attach the inline policies described above.
+
+3. **Create the SNS topic** and subscribe your email for alerts.
+
+4. **Deploy the Lambda functions** (`lambda-function/`) with their required env vars — see each function's docstring.
+   ```
+   YOUTUBE_API_KEY, S3_BUCKET_BRONZE, YOUTUBE_REGIONS, SNS_ALERT_TOPIC_ARN
+   ```
+
+5. **Create the Glue jobs** (`glue-jobs/`), pointing the `--*` job parameters at your actual bucket/database names. Glue 5.1, `G.1X` workers × 2.
+
+6. **Run a Glue Crawler once** to bootstrap the Bronze catalog. After that, `enableUpdateCatalog` on the Glue sinks keeps Silver/Gold catalogs in sync automatically.
+
+7. **Deploy the Step Function** (`step-function/orchestration.asl.json`) using the `yt-data-pipeline-stepFunction-role-dev` role.
+
+8. **Start an execution** and watch it in the Step Functions Graph view.
+
+> Never commit real API keys, account IDs, or ARNs. Use environment variables or Secrets Manager, and scrub setup notes before pushing.
 
 ---
 
 ## Known Gaps / Next Steps
 
-- No infrastructure-as-code (Terraform/CDK) — everything above was built manually via console. That's the honest state of it: reproducible by a human following steps, not reproducible with one command.
+- No infrastructure-as-code (Terraform/CDK) — built manually via console. Reproducible by a human following steps, not by one command.
 - No CI/CD for Glue script deployment — scripts are pasted directly into the Glue console editor.
-- Ingestion is API-key-based with no rotation strategy or secrets manager integration yet.
-- Data quality thresholds (`DQ_MIN_ROW_COUNT`, `DQ_MAX_NULL_PERCENT`) are env-var driven but not tuned against real production volumes.
-- QuickSight/BI layer described in the architecture is not yet built out.
+- No secrets manager integration for the YouTube API key yet.
+- DQ thresholds (`DQ_MIN_ROW_COUNT`, `DQ_MAX_NULL_PERCENT`) are env-var driven but not tuned against real production volumes.
+- QuickSight/BI layer is not yet built.
 
 ---
 
+## References
+
+- [YouTube Data API v3 Docs](https://developers.google.com/youtube/v3)
+- [AWS Glue Documentation](https://docs.aws.amazon.com/glue/)
+- [AWS Step Functions Documentation](https://docs.aws.amazon.com/step-functions/)
+
 ## License
 
-MIT — do whatever you want with it, no warranty.
+MIT
