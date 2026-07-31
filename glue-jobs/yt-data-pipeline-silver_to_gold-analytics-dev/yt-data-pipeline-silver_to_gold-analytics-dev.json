@@ -1,0 +1,64 @@
+{
+	"jobConfig": {
+		"name": "yt-data-pipeline-silver_to_gold-analytics-dev",
+		"description": "",
+		"role": "arn:aws:iam::962988650758:role/yt-data-pipeline-glue-role-dev",
+		"command": "glueetl",
+		"version": "5.1",
+		"runtime": null,
+		"workerType": "G.1X",
+		"numberOfWorkers": 2,
+		"maxCapacity": 2,
+		"jobRunQueuingEnabled": false,
+		"maxRetries": 0,
+		"timeout": 480,
+		"maxConcurrentRuns": 1,
+		"security": "none",
+		"scriptName": "yt-data-pipeline-silver_to_gold-analytics-dev.py",
+		"scriptLocation": "s3://aws-glue-assets-962988650758-ap-south-1/scripts/",
+		"language": "python-3",
+		"spark": true,
+		"sparkConfiguration": "standard",
+		"jobParameters": [
+			{
+				"key": "--conf",
+				"value": "spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
+				"existing": false
+			},
+			{
+				"key": "--gold_bucket",
+				"value": "yt-data-pipeline-gold-dev001",
+				"existing": false
+			},
+			{
+				"key": "--gold_database",
+				"value": "yt-pipeline-gold_db",
+				"existing": false
+			},
+			{
+				"key": "--silver_database",
+				"value": "yt-pipeline-silver_db",
+				"existing": false
+			}
+		],
+		"tags": [],
+		"jobMode": "DEVELOPER_MODE",
+		"createdOn": "2026-07-29T11:12:08.379Z",
+		"developerMode": true,
+		"connectionsList": [],
+		"temporaryDirectory": "s3://aws-glue-assets-962988650758-ap-south-1/temporary/",
+		"logging": true,
+		"glueHiveMetastore": true,
+		"etlAutoTuning": true,
+		"metrics": true,
+		"observabilityMetrics": true,
+		"bookmark": "job-bookmark-disable",
+		"sparkPath": "s3://aws-glue-assets-962988650758-ap-south-1/sparkHistoryLogs/",
+		"flexExecution": false,
+		"minFlexWorkers": null,
+		"maintenanceWindow": null
+	},
+	"hasBeenSaved": false,
+	"usageProfileName": null,
+	"script": "import sys\nfrom awsglue.utils import getResolvedOptions\nfrom pyspark.context import SparkContext\nfrom awsglue.context import GlueContext\nfrom awsglue.job import Job\nfrom awsglue.dynamicframe import DynamicFrame\n\nfrom pyspark.sql import functions as F\nfrom pyspark.sql.window import Window\n\n\"\"\"\nGlue Job: Silver → Gold (Analytics Aggregations)\n─────────────────────────────────────────────────\nReads cleansed statistics and reference data from Silver,\njoins them, and produces business-level aggregations in the Gold layer.\n\nGold layer tables are optimized for analytics queries in Athena/QuickSight.\n\nGold tables produced:\n  1. trending_analytics   — Daily trending summaries per region\n  2. channel_analytics    — Channel performance metrics\n  3. category_analytics   — Category-level trends over time\n\nJob Parameters:\n    --JOB_NAME              — Glue job name\n    --silver_database       — Silver Glue catalog database\n    --gold_bucket           — Gold S3 bucket\n    --gold_database         — Gold Glue catalog database\n\"\"\"\n\n# ── Job Setup ────────────────────────────────────────────────────────────────\nargs = getResolvedOptions(sys.argv, [\n    \"JOB_NAME\",\n    \"silver_database\",\n    \"gold_bucket\",\n    \"gold_database\",\n])\n\nsc = SparkContext()\nglueContext = GlueContext(sc)\nspark = glueContext.spark_session\njob = Job(glueContext)\njob.init(args[\"JOB_NAME\"], args)\nlogger = glueContext.get_logger()\n\nSILVER_DB = args[\"silver_database\"]\nGOLD_BUCKET = args[\"gold_bucket\"]\nGOLD_DB = args[\"gold_database\"]\n\n\n# ── Read Silver Tables ──────────────────────────────────────────────────────\nlogger.info(\"Reading Silver layer tables...\")\n\nstats_dyf = glueContext.create_dynamic_frame.from_catalog(\n    database=SILVER_DB,\n    table_name=\"clean_statistics\",\n    transformation_ctx=\"stats\",\n)\nstats_df = stats_dyf.toDF()\nlogger.info(f\"Statistics records: {stats_df.count()}\")\n\n# ── Read Reference Data (optional) + Build category lookup ───────────────────\nlogger.info(\"Attempting to read Silver reference data for category names...\")\n\ntry:\n    ref_dyf = glueContext.create_dynamic_frame.from_catalog(\n        database=SILVER_DB,\n        table_name=\"clean_reference_data\",\n        transformation_ctx=\"ref\",\n    )\n    ref_df = ref_dyf.toDF()\n\n    category_lookup = None\n\n    # Some crawlers flatten nested fields in different ways; handle common cases\n    if \"id\" in ref_df.columns and \"snippet.title\" in ref_df.columns:\n        category_lookup = ref_df.select(\n            F.col(\"id\").cast(\"long\").alias(\"category_id\"),\n            F.col(\"`snippet.title`\").alias(\"category_name\"),\n        ).dropDuplicates([\"category_id\"])\n\n    elif \"id\" in ref_df.columns and \"snippet_title\" in ref_df.columns:\n        category_lookup = ref_df.select(\n            F.col(\"id\").cast(\"long\").alias(\"category_id\"),\n            F.col(\"snippet_title\").alias(\"category_name\"),\n        ).dropDuplicates([\"category_id\"])\n\n    else:\n        logger.warn(\n            \"Could not find expected category title columns in reference data. \"\n            f\"Columns found: {ref_df.columns}\"\n        )\n\n    if category_lookup is not None:\n        logger.info(f\"Category lookup entries: {category_lookup.count()}\")\n\n        # Ensure join key types match\n        if \"category_id\" in stats_df.columns:\n            stats_df = stats_df.withColumn(\"category_id\", F.col(\"category_id\").cast(\"long\"))\n\n        stats_df = stats_df.join(\n            F.broadcast(category_lookup),\n            on=\"category_id\",\n            how=\"left\",\n        )\n\nexcept Exception as e:\n    logger.warn(f\"Could not load reference data: {e}. Proceeding without category names.\")\n\n# ✅ Always guarantee category_name exists\nif \"category_name\" not in stats_df.columns:\n    stats_df = stats_df.withColumn(\"category_name\", F.lit(\"Unknown\"))\nelse:\n    stats_df = stats_df.fillna(\"Unknown\", subset=[\"category_name\"])\n\n# ══════════════════════════════════════════════════════════════════════════════\n# GOLD TABLE 1: Trending Analytics (daily summaries per region)\n# ══════════════════════════════════════════════════════════════════════════════\nlogger.info(\"Building Gold: trending_analytics...\")\n\ntrending = stats_df.groupBy(\"region\", \"trending_date_parsed\").agg(\n    F.count(\"video_id\").alias(\"total_videos\"),\n    F.sum(\"views\").alias(\"total_views\"),\n    F.sum(\"likes\").alias(\"total_likes\"),\n    F.sum(\"dislikes\").alias(\"total_dislikes\"),\n    F.sum(\"comment_count\").alias(\"total_comments\"),\n    F.avg(\"views\").alias(\"avg_views_per_video\"),\n    F.avg(\"like_ratio\").alias(\"avg_like_ratio\"),\n    F.avg(\"engagement_rate\").alias(\"avg_engagement_rate\"),\n    F.max(\"views\").alias(\"max_views\"),\n    F.countDistinct(\"channel_title\").alias(\"unique_channels\"),\n    F.countDistinct(\"category_id\").alias(\"unique_categories\"),\n)\n\ntrending = trending.withColumn(\"_aggregated_at\", F.current_timestamp())\n\ntrending_path = f\"s3://{GOLD_BUCKET}/youtube/trending_analytics/\"\ntrending_dyf = DynamicFrame.fromDF(trending, glueContext, \"trending\")\n\nsink1 = glueContext.getSink(\n    connection_type=\"s3\",\n    path=trending_path,\n    enableUpdateCatalog=True,\n    updateBehavior=\"UPDATE_IN_DATABASE\",\n    partitionKeys=[\"region\"],\n)\nsink1.setCatalogInfo(catalogDatabase=GOLD_DB, catalogTableName=\"trending_analytics\")\nsink1.setFormat(\"glueparquet\", compression=\"snappy\")\nsink1.writeFrame(trending_dyf)\nlogger.info(f\"  Written {trending.count()} rows → {trending_path}\")\n\n# ══════════════════════════════════════════════════════════════════════════════\n# GOLD TABLE 2: Channel Analytics\n# ══════════════════════════════════════════════════════════════════════════════\nlogger.info(\"Building Gold: channel_analytics...\")\n\nchannel = stats_df.groupBy(\"channel_title\", \"region\").agg(\n    F.countDistinct(\"video_id\").alias(\"total_videos\"),\n    F.sum(\"views\").alias(\"total_views\"),\n    F.sum(\"likes\").alias(\"total_likes\"),\n    F.sum(\"comment_count\").alias(\"total_comments\"),\n    F.avg(\"views\").alias(\"avg_views_per_video\"),\n    F.avg(\"engagement_rate\").alias(\"avg_engagement_rate\"),\n    F.max(\"views\").alias(\"peak_views\"),\n    F.count(\"trending_date_parsed\").alias(\"times_trending\"),\n    F.min(\"trending_date_parsed\").alias(\"first_trending\"),\n    F.max(\"trending_date_parsed\").alias(\"last_trending\"),\n    F.collect_set(\"category_name\").alias(\"categories\"),\n)\n\n# Rank channels by total views within each region\nwindow_rank = Window.partitionBy(\"region\").orderBy(F.col(\"total_views\").desc())\nchannel = channel.withColumn(\"rank_in_region\", F.row_number().over(window_rank))\nchannel = channel.withColumn(\"_aggregated_at\", F.current_timestamp())\n\nchannel_path = f\"s3://{GOLD_BUCKET}/youtube/channel_analytics/\"\nchannel_dyf = DynamicFrame.fromDF(channel, glueContext, \"channel\")\n\nsink2 = glueContext.getSink(\n    connection_type=\"s3\",\n    path=channel_path,\n    enableUpdateCatalog=True,\n    updateBehavior=\"UPDATE_IN_DATABASE\",\n    partitionKeys=[\"region\"],\n)\nsink2.setCatalogInfo(catalogDatabase=GOLD_DB, catalogTableName=\"channel_analytics\")\nsink2.setFormat(\"glueparquet\", compression=\"snappy\")\nsink2.writeFrame(channel_dyf)\nlogger.info(f\"  Written {channel.count()} rows → {channel_path}\")\n\n# ══════════════════════════════════════════════════════════════════════════════\n# GOLD TABLE 3: Category Analytics (trend over time)\n# ══════════════════════════════════════════════════════════════════════════════\nlogger.info(\"Building Gold: category_analytics...\")\n\ncategory = stats_df.groupBy(\"category_name\", \"category_id\", \"region\", \"trending_date_parsed\").agg(\n    F.count(\"video_id\").alias(\"video_count\"),\n    F.sum(\"views\").alias(\"total_views\"),\n    F.sum(\"likes\").alias(\"total_likes\"),\n    F.sum(\"comment_count\").alias(\"total_comments\"),\n    F.avg(\"engagement_rate\").alias(\"avg_engagement_rate\"),\n    F.countDistinct(\"channel_title\").alias(\"unique_channels\"),\n)\n\n# Category share of views per region per day\nwindow_total = Window.partitionBy(\"region\", \"trending_date_parsed\")\ncategory = category.withColumn(\n    \"view_share_pct\",\n    F.round(F.col(\"total_views\") / F.sum(\"total_views\").over(window_total) * 100, 2)\n)\ncategory = category.withColumn(\"_aggregated_at\", F.current_timestamp())\n\ncategory_path = f\"s3://{GOLD_BUCKET}/youtube/category_analytics/\"\ncategory_dyf = DynamicFrame.fromDF(category, glueContext, \"category\")\n\nsink3 = glueContext.getSink(\n    connection_type=\"s3\",\n    path=category_path,\n    enableUpdateCatalog=True,\n    updateBehavior=\"UPDATE_IN_DATABASE\",\n    partitionKeys=[\"region\"],\n)\nsink3.setCatalogInfo(catalogDatabase=GOLD_DB, catalogTableName=\"category_analytics\")\nsink3.setFormat(\"glueparquet\", compression=\"snappy\")\nsink3.writeFrame(category_dyf)\nlogger.info(f\"  Written {category.count()} rows → {category_path}\")\n\nlogger.info(\"Gold layer build complete.\")\njob.commit()"
+}
