@@ -1,4 +1,4 @@
-# YouTube Trending Data Pipeline — AWS (S3 · Glue · Lambda · Athena · Step Functions)
+# YouTube Trending Data Analytics Pipeline — AWS (S3 · Glue · Lambda · Athena · Step Functions)
 
 An end-to-end, serverless data engineering pipeline on AWS that ingests YouTube trending video data — live via the **YouTube Data API v3**, plus a static Kaggle dataset — processes it through a medallion architecture (Bronze → Silver → Gold), runs automated data quality gating, and produces analytics-ready tables queryable via Amazon Athena. Fully orchestrated with AWS Step Functions, with SNS alerting on every failure branch.
 
