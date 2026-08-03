@@ -20,7 +20,7 @@ An end-to-end, serverless data engineering pipeline on AWS that ingests YouTube 
 
 ## Architecture
 
-
+![Architecture](assets/Architecture.png)
 
 ```
 YouTube Data API ─┐
